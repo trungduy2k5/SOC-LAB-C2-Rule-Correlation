@@ -1,0 +1,99 @@
+#1. CRITICAL: C2 DNS-over-HTTPS (DoH) Tunneling Detected
+#Mô tả: Phát hiện mã độc lạm dụng giao thức DoH (truy vấn DNS qua HTTPS mã hóa) để vượt qua các bộ lọc DNS truyền thống. Tương quan chéo giữa TLS SNI của Suricata (dns.google, cloudflare-dns.com) và tiến trình Sysmon.
+#
+#Cơ chế tương quan: Grouping theo ProcessGuid, lọc các tiến trình khởi chạy ngoài đường dẫn tiêu chuẩn hoặc có Parent Process bất thường kết hợp với tần suất DoH requests >= 20.
+
+(index=* sourcetype=_json event_type="tls" (tls.sni="dns.google" OR tls.sni="cloudflare-dns.com")) OR (index=* source="*Sysmon*" (EventCode=1 OR EventCode=3))
+| eval common_ip = trim(coalesce(dest_ip, DestinationIp))
+| eventstats count(eval(event_type="tls")) as DoH_Request_Count, values(tls.sni) as tls_sni by common_ip
+| eval Process_Path = lower(Image)
+| eval Parent_Name = lower(replace(ParentImage, ".*\\\\", ""))
+| stats earliest(_time) as _time, values(Process_Path) as process_path, values(Parent_Name) as parent_name, values(CommandLine) as cmd_line, values(common_ip) as dest_ip, values(DoH_Request_Count) as DoH_Request_Count, values(tls_sni) as tls_sni by ProcessGuid
+| search dest_ip="*" process_path="*"
+| eval Is_Malicious_Location = if(NOT (match(process_path, "^c:\\\\program files") OR match(process_path, "^c:\\\\program files \\(x86\\)") OR match(process_path, "\\\\appdata\\\\local\\\\") OR match(process_path, "^c:\\\\windows\\\\system32\\\\")), 1, 0)
+| eval Is_Abnormal_Parent = if(NOT (parent_name="explorer.exe" OR parent_name="chrome.exe" OR parent_name="msedge.exe" OR parent_name="firefox.exe" OR parent_name="brave.exe" OR parent_name="zalo.exe" OR parent_name="teams.exe"), 1, 0)
+| where (Is_Malicious_Location = 1 OR Is_Abnormal_Parent = 1) AND DoH_Request_Count >= 20
+| eval Alert_Name = "CRITICAL: C2 DNS-over-HTTPS Tunneling Detected via Behavior & Correlation"
+| table _time, Alert_Name, process_path, parent_name, cmd_line, dest_ip, tls_sni, DoH_Request_Count
+
+#2. CRITICAL: Automated C2 Beaconing Detected (Low Jitter)
+#Mô tả: Phân tích toán học thống kê dựa trên độ lệch chuẩn thời gian giữa các phiên kết nối (Jitter) từ log flow của Suricata để bóc trần hành vi Beaconing tự động của C2 Agent.
+#
+#Mô hình toán: Đo Jitter_Deviation < 500ms với chu kỳ lặp Flow_Count >= 15.
+index=* event_type="flow"
+| streamstats current=f last(_time) as prev_time by src_ip, dest_ip, dest_port
+| eval time_delta = _time - prev_time
+| stats count as Flow_Count, 
+        avg(time_delta) as Avg_Interval, 
+        stdev(time_delta) as Jitter_Deviation 
+        by src_ip, dest_ip, dest_port
+| where Flow_Count >= 15 AND Jitter_Deviation < 500
+| eval Alert_Name = "CRITICAL: Automated C2 Beaconing Detected (Behavioral)"
+| table Alert_Name, src_ip, dest_ip, dest_port, Flow_Count, Jitter_Deviation
+
+#3. HIGH: Direct IP Connection Without DNS Query (Catch-All)
+#Mô tả: Phát hiện mã độc được gán cứng (hardcoded) địa chỉ IP C2 trong mã nguồn, thực thi từ các đường dẫn nguy cơ cao (Temp, Public, ProgramData) và khởi tạo kết nối mạng (Sysmon EventCode 3) mà hoàn toàn không thực hiện truy vấn phân giải tên miền (Sysmon EventCode 22).
+
+index=* source="*Sysmon*" (EventCode=3 OR EventCode=1)
+| eval Process_Path = lower(coalesce(Image, "unknown"))
+| eval is_suspicious = if(match(Process_Path, "\\\\users\\\\") OR match(Process_Path, "\\\\appdata\\\\local\\\\temp\\\\") OR match(Process_Path, "\\\\windows\\\\temp\\\\") OR match(Process_Path, "\\\\programdata\\\\") OR Process_Path=="unknown", 1, 0)
+| stats latest(_time) as _time, 
+        sum(eval(if(EventCode==3, 1, 0))) as Network_Events, 
+        sum(eval(if(EventCode==22, 1, 0))) as DNS_Events, 
+        values(Process_Path) as Image_Path, 
+        values(DestinationIp) as Dest_IP, 
+        values(DestinationPort) as Dest_Port,
+        max(is_suspicious) as is_suspicious
+        by ProcessGuid
+| where is_suspicious==1 AND Network_Events > 0 AND DNS_Events == 0
+| eval Alert_Name = "HIGH: Direct IP Connection Without DNS (Catch-All)"
+| table _time, Alert_Name, Image_Path, Dest_IP, Dest_Port, ProcessGuid, Network_Events, DNS_Events
+
+#4. CRITICAL: Asymmetric Data Exfiltration Tunneling
+#Mô tả: Tương quan dữ liệu dung lượng truyền tải mạng từ Suricata (bytes_toserver vs bytes_toclient) với tiến trình khởi tạo từ Sysmon. Cảnh báo khi có sự bất đối xứng lưu lượng lớn (Tỷ lệ đẩy ra / nhận về Ratio > 10 hoặc TotalOut > 30MB).
+index=* (sourcetype=_json event_type=flow) OR (source="WinEventLog:Microsoft-Windows-Sysmon/Operational" (EventCode=3 OR EventCode=1)) 
+| eval Common_SrcIP = coalesce(SourceIp, sourceIp, src_ip, source_ip) 
+| eval Common_DstIP = coalesce(DestinationIp, desIp, destIp, dest_ip, destination_ip) 
+| eval BytesOut = coalesce('flow.bytes_toserver', TotalBytesOut, 0)
+| eval BytesIn = coalesce('flow.bytes_toclient', TotalBytesIn, 0)
+| eventstats values(ParentImage) as Parent_Process, values(CommandLine) as Cmd_Line by ProcessGuid 
+| stats sum(BytesOut) as TotalOut, sum(BytesIn) as TotalIn, count(eval(event_type="flow")) as Suricata_Flow_Count, count(eval(EventCode=3)) as Sysmon_Conn_Count, values(Image) as Process_Name, values(ParentImage) as Parent_Process, values(CommandLine) as cmd_line, values(ProcessGuid) as ID, earliest(_raw) as _raw by Common_SrcIP, Common_DstIP 
+| eval TotalIn = if(TotalIn == 0 OR isnull(TotalIn), 1, TotalIn) 
+| eval Ratio = round(TotalOut/TotalIn, 2) 
+| where (TotalOut > 30000000 OR Suricata_Flow_Count > 50 OR Ratio > 10) AND Sysmon_Conn_Count > 0 
+| table _time, Common_SrcIP, Common_DstIP, TotalOut, TotalIn, Process_Name, ID, Ratio, Suricata_Flow_Count, Sysmon_Conn_Count
+
+
+#5. HIGH: Suspicious Lateral Movement via Non-Standard Port
+#Mô tả: Giám sát hành vi rà quét hoặc tạo Reverse Tunnel (như Chisel) để dịch chuyển ngang trong mạng nội bộ trên các cổng dịch vụ phi tiêu chuẩn (loại trừ các cổng phổ biến như 80, 443, 445, 135, 88,...).
+index="main" source="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=3 
+| eval Process_Path = lower(Image) 
+| eval is_internal = if(cidrmatch("10.0.0.0/8", DestinationIp) OR cidrmatch("172.16.0.0/12", DestinationIp) OR cidrmatch("192.168.0.0/16", DestinationIp), 1, 0) 
+| where is_internal == 1 AND NOT cidrmatch("127.0.0.0/8", DestinationIp) 
+| search NOT DestinationPort IN (53, 80, 88, 135, 139, 389, 443, 445, 3268) 
+| search NOT Process_Path IN ("*\\windows\\system32\\svchost.exe", "*\\windows\\system32\\lsass.exe", "*\\windows\\system32\\dfsrs.exe", "*\\windows\\system32\\spoolsv.exe") 
+| bin _time span=5m 
+| stats count as Connection_Count, values(DestinationPort) as Dest_Ports, values(Protocol) as Network_Protocol, earliest(_raw) as _raw by _time, Process_Path, SourceIp, DestinationIp 
+| eval Alert_Name="HIGH: Suspicious Lateral Movement (Non-standard Internal Port)" 
+| table _time, Computer, User, Process_Path, SourceIp, DestinationIp, Dest_Ports, Network_Protocol, Connection_Count, Alert_Name, _raw
+
+#6. Dynamic Baseline & Anomaly First-Time Seen Network Process
+#Mô tả: Tự động xây dựng danh sách trắng động (known_network_processes.csv) chứa các tiến trình thường xuyên kết nối mạng (cập nhật vĩnh viễn và tự động xóa tiến trình không hoạt động > 7 ngày). Phát hiện ngay lập tức bất kỳ tiến trình lạ nào lần đầu tiên khởi tạo kết nối mạng (First Time Seen Process).
+
+#Xây dựng Baseline Lookup:
+index="main" source="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=3
+| eval Process_Path = lower(Image)
+| stats max(_time) as Last_Seen by Process_Path
+| inputlookup append=t known_network_processes.csv
+| stats max(Last_Seen) as Last_Seen by Process_Path
+| eval age = now() - Last_Seen
+| where age < 604800
+| outputlookup known_network_processes.csv
+
+#Rule Phát hiện Anomaly:
+index="main" source="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=3 
+| eval Process_Path = lower(Image) 
+| lookup known_network_processes.csv Process_Path OUTPUT count 
+| where isnull(count) 
+| eval Alert_Name = "AN1227: First Time Seen Process Making Network Connection" 
+| table _time, Alert_Name, Computer, Process_Path, DestinationIp, DestinationPort, _raw
