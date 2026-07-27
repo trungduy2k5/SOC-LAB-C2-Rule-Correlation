@@ -18,3 +18,4 @@ dựa trên phân tích hành vi, và thực hiện theo các Detection Method d
 
 ** Các kịch bản không phản ánh thực tế các cuộc tấn công hiện nay, đề tài dựa trên các hành vi cốt lõi để xây dựng các quy tắc, trình độ của sinh viên đại học, nhằm mục đích nghiên cứu và học tập.
 ** Repo này là 1 phần nhỏ trong đề tài được thực hiện riêng lẻ bởi 1 cá nhân.
+** AT200217 - Nguyễn Trung Duy
